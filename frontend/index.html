@@ -1,0 +1,459 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ha-fleet — Fleet Manager</title>
+  <style>
+    :root {
+      --bg: #0d1117; --panel: #161b22; --panel2: #1c2129; --fg: #e6edf3; --muted: #8b949e;
+      --ok: #3fb950; --off: #f85149; --accent: #58a6ff; --border: #30363d; --warn: #d29922;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body { margin: 0; font: 14px/1.5 system-ui, -apple-system, sans-serif;
+           background: var(--bg); color: var(--fg); }
+    app-shell { display: block; height: 100vh; }
+  </style>
+</head>
+<body>
+  <app-shell></app-shell>
+
+  <script type="module">
+    import { LitElement, html, css, repeat } from 'https://cdn.jsdelivr.net/gh/lit/dist@3/all/lit-all.min.js';
+
+    const API = (location.search.match(/[?&]api=([^&]+)/) || [, 'http://127.0.0.1:8080'])[1];
+
+    // --- auth: cookie session set by the OIDC callback; /auth/me reports role --
+    const Auth = {
+      me: { authenticated: false },
+      _subs: new Set(),
+      onChange(f) { this._subs.add(f); return () => this._subs.delete(f); },
+      async refresh() {
+        try {
+          const r = await fetch(`${API}/auth/me`, { credentials: 'include' });
+          this.me = await r.json();
+        } catch { this.me = { authenticated: false }; }
+        this._subs.forEach(f => f());
+      },
+      role() { return this.me.role || null; },
+      can(min) {
+        const order = { viewer: 0, operator: 1, admin: 2 };
+        return this.me.authenticated && order[this.me.role] >= order[min];
+      },
+      async logout() { await fetch(`${API}/auth/logout`, { method: 'POST', credentials: 'include' }); await this.refresh(); },
+    };
+
+    async function api(path, { method = 'GET', body } = {}) {
+      const headers = body ? { 'content-type': 'application/json' } : {};
+      const r = await fetch(`${API}${path}`, { method, headers, credentials: 'include', body: body ? JSON.stringify(body) : undefined });
+      const text = await r.text();
+      let json; try { json = text ? JSON.parse(text) : {}; } catch { json = { raw: text }; }
+      return { ok: r.ok, status: r.status, json };
+    }
+
+    const ui = css`
+      button { background: var(--panel2); color: var(--fg); border: 1px solid var(--border);
+               border-radius: 6px; padding: 6px 12px; cursor: pointer; font: inherit; }
+      button:hover:not(:disabled) { border-color: var(--accent); }
+      button:disabled { opacity: .4; cursor: not-allowed; }
+      button.primary { background: #1f6feb33; border-color: var(--accent); }
+      button.danger { border-color: var(--off); color: #ff7b72; }
+      button.danger:hover:not(:disabled) { background: #2d1618; }
+      input, select { background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+               border-radius: 6px; padding: 6px 8px; font: inherit; }
+      input:focus, select:focus { outline: none; border-color: var(--accent); }
+      label { font-size: 12px; color: var(--muted); display: block; margin: 10px 0 2px; }
+      pre { background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+            padding: 10px; overflow: auto; font-size: 12px; color: #c9d1d9; max-height: 260px; }
+      .muted { color: var(--muted); font-size: 12px; }
+      .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+      .pill { font-size: 11px; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--border); }
+    `;
+
+    // ---- <app-shell>: top bar + sidebar + detail pane -----------------------
+    class AppShell extends LitElement {
+      static properties = { instances: { state: true }, selected: { state: true }, error: { state: true }, _me: { state: true } };
+      static styles = [ui, css`
+        :host { display: grid; grid-template-rows: auto 1fr; height: 100vh; }
+        header { display: flex; align-items: center; gap: 12px; padding: 12px 20px;
+                 border-bottom: 1px solid var(--border); background: var(--panel); }
+        header h1 { font-size: 16px; margin: 0; }
+        header .sub { color: var(--muted); font-size: 12px; }
+        header .spacer { flex: 1; }
+        .who { font-size: 12px; }
+        .role-admin { color: #ff7b72; } .role-operator { color: var(--accent); } .role-viewer { color: var(--muted); }
+        .body { display: grid; grid-template-columns: 300px 1fr; min-height: 0; }
+        aside { border-right: 1px solid var(--border); overflow: auto; background: var(--panel); }
+        .sb-head { padding: 10px 14px; color: var(--muted); font-size: 12px;
+                   display: flex; justify-content: space-between; align-items: center;
+                   position: sticky; top: 0; background: var(--panel); }
+        main { overflow: auto; padding: 20px 24px; }
+        .empty { color: var(--muted); padding: 40px; text-align: center; }
+        .login { height: 100vh; display: grid; place-items: center; }
+        .login .card { background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
+                       padding: 40px 48px; text-align: center; max-width: 420px; }
+        .login h1 { font-size: 28px; margin: 0 0 6px; }
+        .login p { color: var(--muted); margin: 0 0 20px; }
+        .login button { font-size: 15px; padding: 10px 20px; }
+        .login .hint { font-size: 12px; color: var(--muted); margin-top: 18px; line-height: 1.7; }
+      `];
+      constructor() {
+        super(); this.instances = []; this.selected = null; this.error = ''; this._me = Auth.me;
+        this._off = Auth.onChange(() => {
+          const was = this._me.authenticated;
+          this._me = Auth.me; this.requestUpdate();
+          if (Auth.me.authenticated && !was) this._poll();   // start polling once signed in
+        });
+        Auth.refresh();
+      }
+      disconnectedCallback() { super.disconnectedCallback(); clearTimeout(this._t); this._off?.(); }
+      async _poll() {
+        if (!Auth.me.authenticated) return;                   // reads are session-gated
+        const { ok, status, json } = await api('/instances');
+        if (ok) {
+          const next = json.instances || [];
+          // Only reassign when the payload actually changed, so an unchanged
+          // fleet produces zero re-render (reference-stable => Lit no-ops).
+          const sig = JSON.stringify(next);
+          if (sig !== this._sig) { this._sig = sig; this.instances = next; }
+          this.error = '';
+        }
+        else if (status === 401) { this.instances = []; this._sig = ''; await Auth.refresh(); }
+        else this.error = `cannot reach operator API at ${API}`;
+        this._t = setTimeout(() => this._poll(), 5000);
+      }
+      _login() { window.location.href = `${API}/auth/start`; }
+      _loginScreen() {
+        return html`<div class="login"><div class="card">
+          <h1>🏠 ha-fleet</h1>
+          <p>Sign in to manage your Home Assistant fleet.</p>
+          <button class="primary" @click=${() => this._login()}>Log in with OIDC</button>
+          <div class="hint">
+            Dev logins (password <code>password</code>):<br>
+            <b>admin@ha-fleet.dev</b> · <b>operator@ha-fleet.dev</b> · <b>viewer@ha-fleet.dev</b>
+          </div>
+        </div></div>`;
+      }
+      render() {
+        const me = this._me;
+        if (!me.authenticated) return this._loginScreen();
+        const sel = this.instances.find(i => i.instance_id === this.selected);
+        return html`
+          <header>
+            <h1>🏠 ha-fleet</h1>
+            <span class="sub">fleet manager</span>
+            <span class="spacer"></span>
+            ${me.authenticated
+              ? html`<span class="who">${me.email || me.sub}
+                       <span class="pill role-${me.role}">${me.role}</span></span>
+                     <button @click=${() => Auth.logout()}>Log out</button>`
+              : html`<span class="who muted">not signed in</span>
+                     <button class="primary" @click=${() => this._login()}>Log in with OIDC</button>`}
+          </header>
+          <div class="body">
+            <aside>
+              <div class="sb-head">
+                <span>${this.instances.length} instance(s) · ${this.instances.filter(i => i.online).length} online</span>
+                <button @click=${() => this._poll()} title="refresh">↻</button>
+              </div>
+              ${repeat(this.instances, i => i.instance_id, i => html`
+                <fleet-row .instance=${i} ?active=${i.instance_id === this.selected}
+                  @pick=${() => (this.selected = i.instance_id)}></fleet-row>`)}
+            </aside>
+            <main>
+              ${this.error ? html`<div class="empty" style="color:var(--off)">${this.error}</div>` : ''}
+              ${sel
+                ? html`<instance-pane .instance=${sel} .me=${me}></instance-pane>`
+                : html`<div class="empty">
+                    Select an instance on the left.<br>
+                    <span class="muted">${me.authenticated ? `Signed in as ${me.role}.` : 'Log in to perform write actions.'}</span>
+                    <div style="margin-top:24px"><templates-panel .me=${me}></templates-panel></div>
+                  </div>`}
+            </main>
+          </div>`;
+      }
+    }
+    customElements.define('app-shell', AppShell);
+
+    // ---- <fleet-row>: sidebar instance row ----------------------------------
+    class FleetRow extends LitElement {
+      static properties = { instance: { attribute: false }, active: { type: Boolean, reflect: true } };
+      static styles = css`
+        :host { display: block; }
+        .row { padding: 10px 14px; border-bottom: 1px solid var(--border); cursor: pointer; }
+        :host([active]) .row, .row:hover { background: var(--panel2); }
+        .name { font-weight: 600; display: flex; justify-content: space-between; align-items: center; }
+        .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+        .meta { color: var(--muted); font-size: 12px; margin-top: 2px; }
+      `;
+      render() {
+        const i = this.instance;
+        return html`
+          <div class="row" @click=${() => this.dispatchEvent(new CustomEvent('pick'))}>
+            <div class="name">${i.display_name}
+              <span class="dot" style="background:${i.online ? 'var(--ok)' : 'var(--off)'}"></span></div>
+            <div class="meta">${i.install_type} · HA ${i.ha_version ?? '—'} · ${(i.capabilities || []).length} caps</div>
+          </div>`;
+      }
+    }
+    customElements.define('fleet-row', FleetRow);
+
+    // ---- <result-box> -------------------------------------------------------
+    class ResultBox extends LitElement {
+      static properties = { result: { attribute: false } };
+      static styles = [ui, css`:host{display:block;margin-top:10px}`];
+      render() {
+        if (!this.result) return html``;
+        const { ok, status, json, label } = this.result;
+        return html`<div class="muted">${label} → HTTP ${status} ${ok ? '✓' : '✗'}</div>
+          <pre style="border-color:${ok ? '#3fb95055' : '#f8514955'}">${JSON.stringify(json, null, 2)}</pre>`;
+      }
+    }
+    customElements.define('result-box', ResultBox);
+
+    // ---- <instance-pane>: tabbed detail (role-aware) ------------------------
+    class InstancePane extends LitElement {
+      static properties = { instance: { attribute: false }, me: { attribute: false },
+        tab: { state: true }, data: { state: true }, result: { state: true }, busy: { state: true } };
+      static styles = [ui, css`
+        h2 { margin: 0 0 2px; font-size: 18px; }
+        .sub { color: var(--muted); font-size: 13px; margin-bottom: 14px; }
+        .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 16px; flex-wrap: wrap; }
+        .tabs button { border: none; border-bottom: 2px solid transparent; border-radius: 0; background: none; padding: 7px 12px; }
+        .tabs button.active { color: var(--accent); border-bottom-color: var(--accent); }
+        h3 { font-size: 13px; color: var(--muted); margin: 16px 0 6px; }
+        .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+        @media (max-width: 760px){ .grid2 { grid-template-columns: 1fr; } }
+        .gate { color: var(--warn); font-size: 12px; }
+        .caps { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+        .cap { font-size: 10px; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; color: var(--muted); }
+        .item { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin: 8px 0; background: var(--panel); }
+        .item-h { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+        .sev-warning { color: var(--warn); border-color: var(--warn); }
+        .sev-info { color: var(--accent); border-color: var(--accent); }
+      `];
+      constructor() { super(); this.tab = 'inspect'; this.data = {}; this.result = null; this.busy = false; }
+      updated(ch) {
+        // app-shell passes a fresh `sel` object every 5s poll, so `ch.has('instance')`
+        // is true even when it's the SAME instance. Only reset + refetch when the
+        // instance IDENTITY actually changes — otherwise the open tab flickers every poll.
+        if (ch.has('instance') && this.instance?.instance_id !== this._lastId) {
+          this._lastId = this.instance?.instance_id;
+          this.result = null; this.data = {}; this._loadTab(this.tab);
+        }
+      }
+      can(min) {
+        const order = { viewer: 0, operator: 1, admin: 2 };
+        return this.me?.authenticated && order[this.me.role] >= order[min];
+      }
+      id() { return this.instance.instance_id; }
+      async _run(label, path, opts) { this.busy = true; this.result = { ...(await api(path, opts)), label }; this.busy = false; }
+      async _load() {
+        const id = this.id();
+        const [s, l, a] = await Promise.all([
+          api(`/instances/${id}/states`), api(`/instances/${id}/logs`), api(`/instances/${id}/audit?limit=20`)]);
+        this.data = { states: s.json, logs: l.json, audit: a.json };
+      }
+      render() {
+        const i = this.instance;
+        const tabs = ['inspect', 'notifications', 'services', 'devices', 'updates', 'manage', 'backups', 'users', 'proxy', 'selfupdate', 'audit'];
+        return html`
+          <h2>${i.display_name}</h2>
+          <div class="sub">${i.instance_id} · ${i.install_type} · HA ${i.ha_version ?? '—'} · ${i.online ? 'online' : 'offline'}</div>
+          <div class="caps">${(i.capabilities || []).map(c => html`<span class="cap">${c}</span>`)}</div>
+          <div class="tabs" style="margin-top:14px">
+            ${tabs.map(t => html`<button class=${this.tab === t ? 'active' : ''}
+              @click=${() => { this.tab = t; this.result = null; this._loadTab(t); }}>${t}</button>`)}
+          </div>
+          ${this._tab()}
+          <result-box .result=${this.result}></result-box>`;
+      }
+      async _loadTab(t) {
+        const id = this.id();
+        if (t === 'inspect' || t === 'audit') return this._load();
+        const path = { notifications: 'notifications', services: 'services', devices: 'devices', updates: 'updates/pending' }[t];
+        if (!path) return;
+        const { json } = await api(`/instances/${id}/${path}`);
+        this.data = { ...this.data, [t]: json };
+      }
+      _tab() {
+        const id = this.id();
+        switch (this.tab) {
+          case 'inspect': return html`<div class="grid2">
+            <div><h3>States</h3><pre>${JSON.stringify(this.data.states ?? {}, null, 2)}</pre></div>
+            <div><h3>Logs</h3><pre>${JSON.stringify(this.data.logs ?? {}, null, 2)}</pre></div></div>`;
+          case 'notifications': return this._notifications();
+          case 'services': return this._services();
+          case 'devices': return this._devices();
+          case 'updates': return this._updates();
+          case 'audit': return html`<h3>Audit (last 20)</h3><pre>${JSON.stringify(this.data.audit ?? {}, null, 2)}</pre>`;
+          case 'manage': return this._manage(id);
+          case 'backups': return this._backups(id);
+          case 'users': return this._users(id);
+          case 'proxy': return this._proxy(id);
+          case 'selfupdate': return this._selfupdate(id);
+        }
+      }
+      _notifications() {
+        const list = (this.data.notifications?.notifications) || [];
+        if (!list.length) return html`<p class="muted">No notifications. ${this.data.notifications ? '' : 'Loading…'}</p>`;
+        return html`<h3>${list.length} notification(s)</h3>
+          ${list.map(n => html`<div class="item">
+            <div class="item-h"><b>${n.title}</b><span class="pill sev-${n.severity}">${n.severity}</span></div>
+            <div class="muted">${n.message}</div>
+            <div class="muted" style="font-size:11px">${n.created_at ?? ''}</div></div>`)}`;
+      }
+      _services() {
+        const d = this.data.services; if (!d) return html`<p class="muted">Loading…</p>`;
+        return html`
+          <h3>Integrations (${(d.integrations||[]).length})</h3>
+          ${(d.integrations||[]).map(s => html`<div class="item">
+            <div class="item-h"><b>${s.name}</b><span class="pill">${s.state}</span></div>
+            <div class="muted">${s.domain}</div></div>`)}
+          <h3>Supervisor add-ons (${(d.addons||[]).length})</h3>
+          ${(d.addons||[]).length === 0 ? html`<p class="muted">None (not a supervised install).</p>`
+            : (d.addons).map(a => html`<div class="item">
+                <div class="item-h"><b>${a.name}</b><span class="pill ${a.state==='started'?'sev-info':''}">${a.state}</span></div>
+                <div class="muted">${a.slug} · v${a.version}</div></div>`)}`;
+      }
+      _devices() {
+        const list = (this.data.devices?.devices) || [];
+        if (!this.data.devices) return html`<p class="muted">Loading…</p>`;
+        return html`<h3>${list.length} device(s)</h3>
+          ${list.map(d => html`<div class="item">
+            <div class="item-h"><b>${d.name}</b><span class="pill">${d.area ?? ''}</span></div>
+            <div class="muted">${d.manufacturer ?? ''} ${d.model ?? ''} · ${d.entities ?? 0} entities</div></div>`)}`;
+      }
+      _updates() {
+        const list = (this.data.updates?.updates) || [];
+        if (!this.data.updates) return html`<p class="muted">Loading…</p>`;
+        if (!list.length) return html`<p class="muted">Everything is up to date.</p>`;
+        return html`<h3>${list.length} update(s) available</h3>
+          ${list.map(u => html`<div class="item">
+            <div class="item-h"><b>${u.title}</b>${u.in_progress ? html`<span class="pill sev-info">in progress</span>` : ''}</div>
+            <div class="muted">${u.installed_version} → <b style="color:var(--accent)">${u.latest_version}</b></div></div>`)}`;
+      }
+      _manage(id) { return html`
+            ${this._needs('operator')}
+            <h3>Lifecycle</h3>
+            <div class="row">
+              <button class="danger" ?disabled=${this.busy || !this.can('admin')}
+                @click=${() => confirm('Restart HA Core?') && this._run('restart', `/instances/${id}/restart`, { method: 'POST' })}>
+                ⟳ Restart HA Core <span class="pill">admin</span></button>
+              <button ?disabled=${this.busy} @click=${() => this._run('health', `/instances/${id}/health`, {})}>Health</button>
+              <button ?disabled=${this.busy} @click=${() => this._run('config.check', `/instances/${id}/config/check`, {})}>Check config</button>
+            </div>
+            <h3>Dashboard</h3>
+            <button class="primary" ?disabled=${this.busy || !this.can('operator')}
+              @click=${() => this._run('dashboard.save', `/instances/${id}/dashboards/lovelace/save`, { method: 'POST', body: { title: 'Pushed from UI', ts: Date.now() } })}>
+              Save demo dashboard <span class="pill">operator</span></button>`; }
+      _backups(id) { return html`
+            ${this._needs('operator')}
+            <div class="row">
+              <button ?disabled=${this.busy} @click=${() => this._run('backups.list', `/instances/${id}/backups`, {})}>List</button>
+              <button class="primary" ?disabled=${this.busy || !this.can('operator')}
+                @click=${() => this._run('backup.create', `/instances/${id}/backups`, { method: 'POST', body: { name: `ui-${Date.now()}` } })}>Create <span class="pill">operator</span></button>
+            </div>
+            <label>Restore by slug <span class="pill">admin</span></label>
+            <div class="row">
+              <input id="slug" placeholder="backup slug" />
+              <button class="danger" ?disabled=${this.busy || !this.can('admin')}
+                @click=${() => { const s = this.renderRoot.querySelector('#slug').value.trim();
+                  if (s && confirm(`Restore ${s}? Overwrites the instance.`)) this._run('backup.restore', `/instances/${id}/backups/${encodeURIComponent(s)}/restore`, { method: 'POST' }); }}>Restore</button>
+            </div>`; }
+      _users(id) { return html`
+            ${this._needs('operator')}
+            <button ?disabled=${this.busy} @click=${() => this._run('users.list', `/instances/${id}/users`, {})}>List users</button>
+            <label>Create user <span class="pill">operator</span></label>
+            <div class="row">
+              <input id="uname" placeholder="username" />
+              <select id="urole"><option>user</option><option>admin</option></select>
+              <button class="primary" ?disabled=${this.busy || !this.can('operator')}
+                @click=${() => { const n = this.renderRoot.querySelector('#uname').value.trim();
+                  if (n) this._run('user.create', `/instances/${id}/users`, { method: 'POST', body: { username: n, role: this.renderRoot.querySelector('#urole').value } }); }}>Create</button>
+            </div>
+            <label>Delete user by id <span class="pill">admin</span></label>
+            <div class="row">
+              <input id="uid" placeholder="user id" />
+              <button class="danger" ?disabled=${this.busy || !this.can('admin')}
+                @click=${() => { const u = this.renderRoot.querySelector('#uid').value.trim();
+                  if (u && confirm(`Delete user ${u}?`)) this._run('user.delete', `/instances/${id}/users/${encodeURIComponent(u)}`, { method: 'DELETE' }); }}>Delete</button>
+            </div>`; }
+      _proxy(id) { return html`
+            <p class="muted">Default-deny. You need a grant for this instance; the principal is your verified session.</p>
+            <label>Grant yourself <span class="pill">admin</span></label>
+            <button ?disabled=${this.busy || !this.can('admin')}
+              @click=${() => this._run('grant', `/grants`, { method: 'POST', body: { principal: this.me.sub, instance_id: this.id(), scope: { proxy: true } } })}>
+              Grant proxy to ${this.me?.sub ?? '—'}</button>
+            <label>Open proxy (byte-stream)</label>
+            <div class="row">
+              <input id="ppath" value="/" />
+              <button class="primary" ?disabled=${this.busy || !this.me?.authenticated}
+                @click=${() => this._run('proxy.open', `/instances/${id}/proxy/open`, { method: 'POST', body: { path: this.renderRoot.querySelector('#ppath').value } })}>Open</button>
+            </div>`; }
+      _selfupdate(id) { return html`
+            ${this._needs('operator')}
+            <p class="muted">A/B slot flip + health gate; uncheck health to see a rollback.</p>
+            <label>Version <span class="pill">operator</span></label>
+            <div class="row">
+              <input id="ver" placeholder="9.9.10" />
+              <label style="margin:0"><input type="checkbox" id="hok" checked /> health passes</label>
+              <button class="primary" ?disabled=${this.busy || !this.can('operator')}
+                @click=${() => this._run('agent.update', `/instances/${id}/agent/update`, { method: 'POST', body: { version: this.renderRoot.querySelector('#ver').value.trim() || '9.9.10', health_ok: this.renderRoot.querySelector('#hok').checked } })}>Push update</button>
+            </div>
+            <h3>Cert / revoke <span class="pill">admin</span></h3>
+            <div class="row">
+              <button ?disabled=${this.busy || !this.can('admin')} @click=${() => this._run('rotate.cert', `/instances/${id}/rotate/cert`, { method: 'POST', body: {} })}>Rotate cert</button>
+              <button class="danger" ?disabled=${this.busy || !this.can('admin')}
+                @click=${() => confirm('Revoke? It must re-enroll.') && this._run('revoke', `/instances/${id}/revoke`, { method: 'POST' })}>Revoke</button>
+            </div>`; }
+      _needs(role) {
+        if (this.can(role)) return html``;
+        return html`<div class="gate">⚠ ${this.me?.authenticated ? `your role (${this.me.role}) can't do everything here — ${role}+ actions are disabled.` : `log in to perform ${role}+ actions.`}</div>`;
+      }
+    }
+    customElements.define('instance-pane', InstancePane);
+
+    // ---- <templates-panel> --------------------------------------------------
+    class TemplatesPanel extends LitElement {
+      static properties = { me: { attribute: false }, templates: { state: true }, result: { state: true }, busy: { state: true } };
+      static styles = [ui, css`
+        :host { display: block; max-width: 640px; margin: 0 auto; text-align: left;
+                background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+        th { color: var(--muted); font-weight: 500; }
+        h3 { margin: 0 0 10px; font-size: 14px; }
+      `];
+      constructor() { super(); this.templates = []; this.result = null; this.busy = false; }
+      connectedCallback() { super.connectedCallback(); this._load(); }
+      can(min) { const o = { viewer: 0, operator: 1, admin: 2 }; return this.me?.authenticated && o[this.me.role] >= o[min]; }
+      async _load() { const { json } = await api('/templates'); this.templates = json.templates || []; }
+      async _run(label, path, opts) { this.busy = true; this.result = { ...(await api(path, opts)), label }; this.busy = false; await this._load(); }
+      render() {
+        return html`
+          <h3>Templates &amp; bulk push <span class="pill">operator</span></h3>
+          <table>
+            <tr><th>name</th><th>kind</th><th></th></tr>
+            ${this.templates.length === 0 ? html`<tr><td colspan="3" class="muted">no templates yet</td></tr>` : ''}
+            ${this.templates.map(t => html`<tr>
+              <td>${t.name}</td><td>${t.kind}</td>
+              <td><button class="primary" ?disabled=${this.busy || !this.can('operator')}
+                @click=${() => this._run('push (all)', `/templates/${t.template_id || t.id}/push`, { method: 'POST', body: { all: true } })}>Push to all</button></td></tr>`)}
+          </table>
+          <label>New template</label>
+          <div class="row">
+            <input id="tname" placeholder="name" />
+            <select id="tkind"><option value="dashboard">dashboard</option><option value="automation">automation</option></select>
+            <button class="primary" ?disabled=${this.busy || !this.can('operator')}
+              @click=${() => { const n = this.renderRoot.querySelector('#tname').value.trim();
+                if (n) this._run('create', '/templates', { method: 'POST', body: { kind: this.renderRoot.querySelector('#tkind').value, name: n, body: { title: n } } }); }}>Create</button>
+          </div>
+          <result-box .result=${this.result}></result-box>`;
+      }
+    }
+    customElements.define('templates-panel', TemplatesPanel);
+  </script>
+</body>
+</html>

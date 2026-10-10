@@ -1,0 +1,54 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hafm-proto",
+    "crates/relay",
+    "crates/agent",
+    "crates/mock-ha",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.75"
+
+# Shared dependency versions pinned once; crates opt in with `workspace = true`.
+# Phase 0 keeps the surface deliberately small (spec 06 §Phase 0).
+[workspace.dependencies]
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
+axum = { version = "0.7", features = ["ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors", "fs"] }
+futures-util = "0.3"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+tungstenite = "0.24"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rustls = "0.23"
+rustls-pemfile = "2"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
+x509-parser = "0.16"
+clap = { version = "4", features = ["derive", "env"] }
+async-trait = "0.1"
+# sqlx is only compiled when the relay's `postgres` feature is on. Runtime query
+# API (no compile-time DB needed), rustls TLS, uuid/json/chrono type support.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "json", "chrono", "macros", "migrate"] }
+# redis is only compiled with the relay's `redis` feature (multi-relay presence).
+redis = { version = "0.27", default-features = false, features = ["tokio-comp"] }
+# OIDC: id_token (JWT) verification against the IdP's JWKS, and the HTTP calls
+# for the auth-code token exchange + JWKS fetch. rustls so no OpenSSL on the box.
+jsonwebtoken = "9"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

@@ -1,0 +1,52 @@
+# Dex — bundled dev OIDC provider for ha-fleet. TEMPLATE.
+#
+# This is the committed template with NO secrets. start.sh generates the real
+# deploy/dex-config.yaml (git-ignored) from this file by substituting the
+# ${DEX_*} values from your .env (copy .env.example). The generated file holds
+# the literal bcrypt hash, so Dex never has to env-expand a $-containing hash.
+#
+# Three static demo users. The relay verifies the id_token and maps the caller
+# to an RBAC role. A real IdP sends a `groups` claim (ha-fleet-admin/operator/
+# viewer) which the relay prefers; Dex's static password DB emits only `email`,
+# so for the dev stack the relay falls back to the email local-part
+# (admin@ / operator@ / viewer@ → Admin / Operator / Viewer).
+#
+# The issuer MUST be the URL the BROWSER uses, because it ends up in the
+# id_token and the relay validates it. The relay's back-channel (discovery /
+# token / JWKS) therefore also uses this same host:port — in compose the relay
+# reaches it via the published host port (see podman-compose.yml OIDC_ISSUER).
+
+issuer: http://127.0.0.1:5556/dex
+
+storage:
+  type: memory
+
+web:
+  http: 0.0.0.0:5556
+
+staticClients:
+  - id: ha-fleet
+    name: ha-fleet relay
+    secret: ${DEX_CLIENT_SECRET}
+    redirectURIs:
+      - http://127.0.0.1:8080/auth/callback
+
+enablePasswordDB: true
+
+# ${DEX_USER_PASSWORD_HASH} is substituted by start.sh (dev default: bcrypt("password")).
+staticPasswords:
+  - email: "admin@ha-fleet.dev"
+    hash: ${DEX_USER_PASSWORD_HASH}
+    username: "admin"
+    userID: "admin-0001"
+  - email: "operator@ha-fleet.dev"
+    hash: ${DEX_USER_PASSWORD_HASH}
+    username: "operator"
+    userID: "operator-0001"
+  - email: "viewer@ha-fleet.dev"
+    hash: ${DEX_USER_PASSWORD_HASH}
+    username: "viewer"
+    userID: "viewer-0001"
+
+oauth2:
+  skipApprovalScreen: true

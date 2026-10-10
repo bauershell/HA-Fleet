@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+# Phase 0 agent identity store (dev)
+/.hafm-agent/
+identity.json
+/ca/
+target/*-e2e/
+target/*-pg/
+# transient CLI lock
+.kiro/settings/.kirocrew-cli-settings.lock
+# dev secrets — real values live here, never committed (see .env.example)
+.env
+# generated Dex config with the literal bcrypt hash (from dex-config.example.yaml + .env)
+/deploy/dex-config.yaml

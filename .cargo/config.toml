@@ -1,0 +1,4 @@
+# `cargo xtask <task>` → runs the xtask dev-task runner.
+# Currently: `cargo xtask e2e` boots the fleet and runs the all-phases E2E.
+[alias]
+xtask = "run --quiet -p xtask --"

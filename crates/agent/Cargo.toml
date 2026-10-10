@@ -1,0 +1,30 @@
+[package]
+name = "agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Edge agent: outbound tunnel client + Core brokers + capability detection (Phase 0)"
+
+[[bin]]
+name = "agent"
+path = "src/main.rs"
+
+[dependencies]
+hafm-proto = { path = "../hafm-proto" }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tungstenite = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+rcgen = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+tokio-rustls = { workspace = true }

@@ -1,0 +1,53 @@
+[package]
+name = "relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Relay/tunnel hub: enroll + tunnel endpoints, in-mem registry, operator API (Phase 0)"
+
+[[bin]]
+name = "relay"
+path = "src/main.rs"
+
+[features]
+# Default: in-memory stores — the walking skeleton runs with zero external deps.
+default = []
+# `postgres`: swap the in-memory stores for sqlx/Postgres impls (04-data-model).
+# Enable with `cargo build -p relay --features postgres`; set DATABASE_URL at
+# runtime (relay --store postgres). Pure compile-time additive: default build
+# never pulls sqlx.
+postgres = ["dep:sqlx"]
+# `redis`: multi-relay presence routing (SECURITY-TODO #15). Registers which
+# relay node owns each agent's live tunnel in Redis, so a horizontally-scaled
+# fleet can look up the owner before forwarding an operator RPC. Additive.
+redis = ["dep:redis"]
+
+[dependencies]
+hafm-proto = { path = "../hafm-proto" }
+tokio = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+futures-util = { workspace = true }
+tokio-tungstenite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+rcgen = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+tokio-rustls = { workspace = true }
+x509-parser = { workspace = true }
+clap = { workspace = true }
+async-trait = { workspace = true }
+jsonwebtoken = { workspace = true }
+reqwest = { workspace = true }
+sqlx = { workspace = true, optional = true }
+redis = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

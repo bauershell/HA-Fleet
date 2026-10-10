@@ -1,0 +1,275 @@
+# ha-fleet — local dev stack (podman compose).
+#
+#   postgres   persistent store for the relay (--store postgres)
+#   redis      multi-relay presence routing (--features redis)
+#   mock-ha    stand-in Home Assistant (supervised, so Supervisor ops work)
+#   relay      the hub: WSS/mTLS agent side (8443), operator HTTP (8080)
+#   agent      edge agent: enrolls over mTLS on first run, then holds the tunnel
+#
+# Drive it with ./start.sh (up | down | logs | status | test | reset).
+#
+# The relay and agent share two named volumes: `ca` (relay writes its CA here,
+# agent reads it to verify + enroll) and `agent-state` (the agent's identity).
+
+services:
+  postgres:
+    image: docker.io/library/postgres:16-alpine
+    environment:
+      POSTGRES_USER: hafleet
+      POSTGRES_PASSWORD: hafleet
+      POSTGRES_DB: hafleet
+    ports:
+      - "127.0.0.1:5433:5432"      # host:container — avoids a local 5432 clash
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "hafleet", "-d", "hafleet"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: docker.io/library/redis:7-alpine
+    ports:
+      - "127.0.0.1:6399:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  # Bundled dev OIDC provider. Three static users (admin@/operator@/viewer@
+  # ha-fleet.dev, password "password") → the relay maps each to an RBAC role.
+  # A real deployment points OIDC_ISSUER at the company IdP and deletes this.
+  dex:
+    image: ghcr.io/dexidp/dex:v2.41.1
+    # Serves deploy/dex-config.yaml, which start.sh GENERATES from
+    # dex-config.example.yaml + .env (git-ignored, holds the literal bcrypt hash).
+    command: ["dex", "serve", "/etc/dex/config.yaml"]
+    volumes:
+      - ./deploy/dex-config.yaml:/etc/dex/config.yaml:ro,z
+    ports:
+      - "127.0.0.1:5556:5556"       # browser-facing issuer host
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:5556/dex/.well-known/openid-configuration"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  mock-ha:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    image: ha-fleet:dev
+    command: ["mock-ha"]
+    environment:
+      MOCK_HA_BIND: "0.0.0.0:8123"   # bind all interfaces inside the container
+      MOCK_SUPERVISOR: "1"           # supervised → backups/updates available
+      MOCK_HA_VERSION: "2026.9.0"
+      MOCK_HA_NAME: "Living Room HA"
+      RUST_LOG: info
+    ports:
+      - "127.0.0.1:8123:8123"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8123/api/"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  relay:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    image: ha-fleet:dev
+    command: ["relay"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+      dex:      { condition: service_healthy }
+    environment:
+      RELAY_AGENT_BIND: "0.0.0.0:8443"
+      RELAY_OP_BIND: "0.0.0.0:8080"
+      RELAY_STORE: "postgres"
+      DATABASE_URL: "postgres://hafleet:hafleet@postgres:5432/hafleet"
+      RELAY_REDIS_URL: "redis://redis:6379"
+      RELAY_CA_DIR: "/data/ca"
+      RELAY_TLS_SANS: "relay"        # SAN so the agent can verify wss://relay:8443
+      RELAY_DEV_CLAIM: "DEV-CLAIM-0001"
+      # Real OIDC (SECURITY-TODO #13): issuer is the BROWSER-facing Dex URL (it
+      # ends up in the id_token's `iss`, which the relay validates). The relay's
+      # own back-channel can't reach 127.0.0.1:5556 from inside its container, so
+      # it fetches discovery/token/JWKS via the host gateway instead.
+      OIDC_ISSUER: "http://127.0.0.1:5556/dex"
+      OIDC_DISCOVERY_BASE: "http://host.containers.internal:5556/dex"
+      OIDC_CLIENT_ID: "ha-fleet"
+      OIDC_CLIENT_SECRET: "${DEX_CLIENT_SECRET}"
+      OIDC_REDIRECT_URI: "http://127.0.0.1:8080/auth/callback"
+      RELAY_FRONTEND_DIR: "/srv/frontend"
+      RUST_LOG: "info,relay=info"
+    ports:
+      - "127.0.0.1:8080:8080"        # operator API + SPA (same-origin)
+      - "127.0.0.1:8443:8443"        # agent-facing mTLS
+    volumes:
+      - ca:/data/ca
+      - ./frontend:/srv/frontend:ro,z   # SPA served same-origin by the relay
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  agent:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    image: ha-fleet:dev
+    depends_on:
+      relay:   { condition: service_healthy }
+      mock-ha: { condition: service_healthy }
+    environment:
+      AGENT_RELAY: "wss://relay:8443"
+      AGENT_HA_BASE: "http://mock-ha:8123"
+      AGENT_RELAY_CA: "/data/ca/ca-cert.pem"
+      AGENT_STATE_DIR: "/data/agent"
+      SUPERVISOR_TOKEN: "mock"       # makes detection report haos (Supervisor caps)
+      RUST_LOG: "info,agent=info"
+    volumes:
+      - ca:/data/ca                  # read the relay CA (shared, read path)
+      - agentstate:/data/agent
+    # Enroll on first run (idempotent: skip if an identity already exists),
+    # then hold the steady-state tunnel. One claim code per fresh DB.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        if [ ! -f /data/agent/identity.json ]; then
+          echo "[agent] enrolling…"
+          agent enroll --claim-code "$${AGENT_CLAIM:-DEV-CLAIM-0001}" || {
+            echo "[agent] enroll failed (claim spent? run ./start.sh reset for a fresh DB)"; exit 1; }
+        else
+          echo "[agent] identity present — skipping enroll"
+        fi
+        echo "[agent] starting steady-state tunnel"
+        exec agent
+
+  # ---- instance 2: supervised, older HA version -------------------------------
+  mock-ha-2:
+    image: ha-fleet:dev
+    command: ["mock-ha"]
+    environment:
+      MOCK_HA_BIND: "0.0.0.0:8123"
+      MOCK_SUPERVISOR: "1"
+      MOCK_HA_VERSION: "2026.6.3"
+      MOCK_HA_NAME: "Garage HA"
+      RUST_LOG: info
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8123/api/"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  agent-2:
+    image: ha-fleet:dev
+    depends_on:
+      relay:     { condition: service_healthy }
+      mock-ha-2: { condition: service_healthy }
+    environment:
+      AGENT_RELAY: "wss://relay:8443"
+      AGENT_HA_BASE: "http://mock-ha-2:8123"
+      AGENT_RELAY_CA: "/data/ca/ca-cert.pem"
+      AGENT_STATE_DIR: "/data/agent"
+      AGENT_CLAIM: "DEV-CLAIM-0001-2"
+      SUPERVISOR_TOKEN: "mock"
+      RUST_LOG: "info,agent=info"
+    volumes:
+      - ca:/data/ca
+      - agentstate2:/data/agent
+    entrypoint: &agent-entrypoint
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        if [ ! -f /data/agent/identity.json ]; then
+          echo "[agent] enrolling with $${AGENT_CLAIM}…"
+          agent enroll --claim-code "$${AGENT_CLAIM:-DEV-CLAIM-0001}" || {
+            echo "[agent] enroll failed (claim spent? run ./start.sh reset)"; exit 1; }
+        else
+          echo "[agent] identity present — skipping enroll"
+        fi
+        echo "[agent] starting steady-state tunnel"
+        exec agent
+
+  # ---- instance 3: NOT supervised (reports container install, fewer caps) -----
+  mock-ha-3:
+    image: ha-fleet:dev
+    command: ["mock-ha"]
+    environment:
+      MOCK_HA_BIND: "0.0.0.0:8123"
+      MOCK_HA_VERSION: "2026.9.0"
+      MOCK_HA_NAME: "Office HA (container)"
+      RUST_LOG: info
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8123/api/"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  agent-3:
+    image: ha-fleet:dev
+    depends_on:
+      relay:     { condition: service_healthy }
+      mock-ha-3: { condition: service_healthy }
+    environment:
+      AGENT_RELAY: "wss://relay:8443"
+      AGENT_HA_BASE: "http://mock-ha-3:8123"
+      AGENT_RELAY_CA: "/data/ca/ca-cert.pem"
+      AGENT_STATE_DIR: "/data/agent"
+      AGENT_CLAIM: "DEV-CLAIM-0001-3"
+      RUST_LOG: "info,agent=info"
+    volumes:
+      - ca:/data/ca
+      - agentstate3:/data/agent
+    entrypoint: *agent-entrypoint
+
+  # ---- instance 4: supervised, newest HA version ------------------------------
+  mock-ha-4:
+    image: ha-fleet:dev
+    command: ["mock-ha"]
+    environment:
+      MOCK_HA_BIND: "0.0.0.0:8123"
+      MOCK_SUPERVISOR: "1"
+      MOCK_HA_VERSION: "2026.10.0"
+      MOCK_HA_NAME: "Cabin HA"
+      RUST_LOG: info
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8123/api/"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  agent-4:
+    image: ha-fleet:dev
+    depends_on:
+      relay:     { condition: service_healthy }
+      mock-ha-4: { condition: service_healthy }
+    environment:
+      AGENT_RELAY: "wss://relay:8443"
+      AGENT_HA_BASE: "http://mock-ha-4:8123"
+      AGENT_RELAY_CA: "/data/ca/ca-cert.pem"
+      AGENT_STATE_DIR: "/data/agent"
+      AGENT_CLAIM: "DEV-CLAIM-0001-4"
+      SUPERVISOR_TOKEN: "mock"
+      RUST_LOG: "info,agent=info"
+    volumes:
+      - ca:/data/ca
+      - agentstate4:/data/agent
+    entrypoint: *agent-entrypoint
+
+volumes:
+  pgdata:
+  ca:
+  agentstate:
+  agentstate2:
+  agentstate3:
+  agentstate4:
